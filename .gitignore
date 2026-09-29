@@ -1,0 +1,10 @@
+/node_modules/
+/dist/
+/target/
+/wasm/pkg/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.mypy_cache/
+.DS_Store

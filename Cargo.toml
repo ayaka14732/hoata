@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/server", "crates/engine"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[profile.release]
+lto = "thin"
+
+[profile.release.package.hoata-engine]
+opt-level = "s"

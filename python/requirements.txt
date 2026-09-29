@@ -1,0 +1,4 @@
+jaxlib==0.11.2
+jax @ git+https://github.com/jax-ml/jax@886d2370c1c959d210f522e352e3ddc6bcff7d6c
+libtpu==0.0.49
+tpuasm==0.1.0

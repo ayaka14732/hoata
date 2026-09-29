@@ -1,0 +1,38 @@
+{
+  "name": "hoata",
+  "description": "Hoata is the compiler explorer for TPU",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MPL-2.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "node scripts/build-wasm.mjs && node scripts/dev.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build": "pnpm run build:wasm && tsc --noEmit && vite build",
+    "check": "tsc --noEmit && cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "start": "cargo run --release --locked -p hoata-server"
+  },
+  "dependencies": {
+    "@radix-ui/react-select": "2.3.7",
+    "lucide-react": "1.48.0",
+    "monaco-editor": "0.57.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "packageManager": "pnpm@12.6.0",
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "26.6.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "playwright": "1.63.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  }
+}
