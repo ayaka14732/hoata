@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent } from 'react'
 import { ArrowDownToLine, ArrowRight, ChevronDown, ChevronLeft, ChevronRight, Search, X } from 'lucide-react'
-import { CodeEditor } from './CodeEditor'
+import { CodeEditor, noHighlight } from './CodeEditor'
+import { SourceCard } from './SourceCard'
 import { Select } from './Select'
 import type { EditorHandle } from './CodeEditor'
 import { Engine } from './engine'
@@ -11,8 +12,10 @@ import type { Compilation, Config, ExampleId, Language, Selection, Summary, Targ
 import clamp from '../examples/clamp.py?raw'
 import square from '../examples/square.py?raw'
 import matmul from '../examples/matmul.py?raw'
+import top_k from '../examples/top_k.py?raw'
+import double_buffer from '../examples/double_buffer.py?raw'
 
-const examples = { clamp, square, matmul }
+const examples = { clamp, square, matmul, top_k, double_buffer }
 const defaultDraft = { source: clamp, target: 'tpu-v4-tc' as Target, example: 'clamp' as ExampleId }
 function readDraft(): typeof defaultDraft {
   try {
@@ -47,8 +50,10 @@ export function App() {
   const [busy, setBusy] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [programIndex, setProgramIndex] = useState(0)
+  const [assemblyView, setAssemblyView] = useState<'kernel' | 'program'>('kernel')
   const [summary, setSummary] = useState<Summary | null>(null)
   const [selection, setSelection] = useState<Selection>(emptySelection)
+  const [hover, setHover] = useState<Selection>(emptySelection)
   const [engineError, setEngineError] = useState('')
   const [search, setSearch] = useState('')
   const [matches, setMatches] = useState<number[]>([])
@@ -56,6 +61,7 @@ export function App() {
   const [panel, setPanel] = useState<'diagnostics' | 'output' | null>(null)
   const [ratio, setRatio] = useState(47)
   const [pendingExample, setPendingExample] = useState<ExampleId | null>(null)
+  const [sourceCard, setSourceCard] = useState(false)
   const dialog = useRef<HTMLDialogElement>(null)
   const workspace = useRef<HTMLDivElement>(null)
   const sourceEditor = useRef<EditorHandle>(null)
@@ -64,8 +70,11 @@ export function App() {
   const activeRequest = useRef<string | null>(null)
   const compileController = useRef<AbortController | null>(null)
   const selectionSerial = useRef(0)
+  const hoverSerial = useRef(0)
   const stale = compilation !== null && (compiledSource !== source || compiledTarget !== target)
   const program = compilation?.ok ? compilation.programs[programIndex] : undefined
+  const hasKernelView = Boolean(summary?.kernel_ranges.length)
+  const kernelView = assemblyView === 'kernel' && hasKernelView
   const linked = Boolean(program && summary && !stale && !busy)
   const live = useRef({ linked, source, target, config })
   live.current = { linked, source, target, config }
@@ -110,7 +119,7 @@ export function App() {
   useEffect(() => {
     let current = true
     ++selectionSerial.current
-    setSummary(null); setSelection(emptySelection); setEngineError('')
+    setSummary(null); setSelection(emptySelection); setHover(emptySelection); setEngineError('')
     setSearch(''); setMatches([])
     if (program) {
       engine.current!.call<Summary>('load', JSON.stringify(program)).then(result => {
@@ -122,28 +131,34 @@ export function App() {
     return () => { current = false }
   }, [program])
   useEffect(() => {
-    sourceEditor.current?.decorate(linked ? summary : null, linked ? selection.source_lines : [])
-    assemblyEditor.current?.decorate(summary, linked ? selection.assembly_lines : [], matches)
-  }, [summary, selection, linked, matches])
+    sourceEditor.current?.decorate(linked ? summary : null, linked ? { lines: hover.source_lines, callers: hover.caller_source_lines, ranges: hover.source_ranges } : noHighlight)
+    assemblyEditor.current?.decorate(summary, linked ? { lines: hover.assembly_lines, callers: hover.caller_assembly_lines, ranges: [] } : noHighlight, matches)
+  }, [summary, hover, linked, matches])
+  useEffect(() => {
+    assemblyEditor.current?.showOnly(kernelView ? summary!.kernel_ranges : null)
+    // Folding shifts the viewport; scroll to the first mapped instruction again.
+    if (summary) assemblyEditor.current?.reveal(summary.preferred_line)
+  }, [kernelView, summary])
   useEffect(() => {
     sourceEditor.current?.markErrors(!stale ? compilation?.diagnostics ?? [] : [])
   }, [compilation, stale])
   useEffect(() => {
-    ++selectionSerial.current
-    if (!linked) setSelection(emptySelection)
+    ++selectionSerial.current; ++hoverSerial.current
+    if (!linked) { setSelection(emptySelection); setHover(emptySelection) }
   }, [linked])
   useEffect(() => {
     let current = true
     if (!summary) return
     const timer = setTimeout(() => {
-      engine.current!.call<number[]>('search', search).then(found => {
+      engine.current!.call<number[]>('search', search).then(result => {
         if (!current) return
+        const found = kernelView ? result.filter(line => summary.kernel_ranges.some(range => range.start <= line && line <= range.end)) : result
         setMatches(found); setMatchIndex(0)
         if (found.length) assemblyEditor.current?.reveal(found[0])
       }).catch(error => { if (current) setEngineError(String(error)) })
     }, 120)
     return () => { current = false; clearTimeout(timer) }
-  }, [search, summary])
+  }, [search, summary, kernelView])
   useEffect(() => {
     if (pendingExample) dialog.current?.showModal()
     else dialog.current?.close()
@@ -192,8 +207,23 @@ export function App() {
       const result = await engine.current!.call<Selection>(kind, line)
       if (serial !== selectionSerial.current || !live.current.linked) return
       setSelection(result)
+      setSourceCard(kind === 'assembly' && result.details.length > 0)
       if (kind === 'source' && result.assembly_lines.length) assemblyEditor.current?.reveal(result.assembly_lines[0])
       if (kind === 'assembly' && result.source_lines.length) sourceEditor.current?.reveal(result.source_lines[0])
+    } catch (error) { setEngineError(String(error)) }
+  }
+  // Hover links both panes, as in Compiler Explorer; clicking only opens the
+  // instruction source card and scrolls the other pane.
+  async function hoverLine(kind: 'source' | 'assembly', line: number | null) {
+    const serial = ++hoverSerial.current
+    if (line === null || !live.current.linked) { setHover(emptySelection); return }
+    try {
+      const result = await engine.current!.call<Selection>(kind, line)
+      if (serial !== hoverSerial.current || !live.current.linked) return
+      // Only instructions with a recorded source take part in the link; an
+      // unmapped instruction stays uncoloured, like an unmapped source line.
+      const mapped = new Set(summary?.hints.map(hint => hint.line))
+      setHover({ ...result, assembly_lines: result.assembly_lines.filter(line => mapped.has(line)) })
     } catch (error) { setEngineError(String(error)) }
   }
   async function cancel() {
@@ -243,7 +273,7 @@ export function App() {
       <div className="editor-workspace" ref={workspace} dir="ltr" style={{ '--source-width': `${ratio}%` } as CSSProperties}>
         <section className="editor-panel source-panel" dir={dir}>
           <div className="editor-panel-header"><bdi>kernel.py</bdi><button className="icon-button" onClick={() => download('kernel.py', source)} title={t.downloadSource} aria-label={t.downloadSource}><ArrowDownToLine size={15} /></button></div>
-          <CodeEditor ref={sourceEditor} kind="source" value={source} label={t.sourceLabel} onChange={setSource} onSelect={line => void select('source', line)} onCompile={() => void compile()} />
+          <CodeEditor ref={sourceEditor} kind="source" value={source} label={t.sourceLabel} onChange={setSource} onSelect={line => void select('source', line)} onHover={line => void hoverLine('source', line)} onCompile={() => void compile()} />
         </section>
 
         <div className="resizer" role="separator" tabIndex={0} aria-label={t.resize} aria-orientation="vertical" aria-valuemin={32} aria-valuemax={68} aria-valuenow={Math.round(ratio)} onPointerDown={resize} onDoubleClick={() => setRatio(47)} onKeyDown={event => {
@@ -257,6 +287,7 @@ export function App() {
           <div className="editor-panel-header"><span>{t.assembly}</span><span className={`result-status ${stale ? 'stale' : compilation && !compilation.ok ? 'failed' : ''}`} aria-live="polite" data-testid="compile-status">{status}</span><button className="icon-button" disabled={!program} onClick={() => program && download(`kernel-${program.target}-${program.id.replace(':', '-')}.tpuasm`, program.assembly)} title={t.downloadAssembly} aria-label={t.downloadAssembly}><ArrowDownToLine size={15} /></button></div>
           {program && <div className="assembly-tools">
             {compilation!.programs.length > 1 && <Select className="assembly-select" label={t.program} value={String(programIndex)} dir={dir} onChange={value => setProgramIndex(Number(value))} options={compilation!.programs.map((item, index) => ({ value: String(index), label: `${t.program} ${item.id}` }))} />}
+            {hasKernelView && <Select className="assembly-select" label={t.view} value={assemblyView} dir={dir} onChange={value => setAssemblyView(value as 'kernel' | 'program')} options={[{ value: 'kernel', label: t.kernel }, { value: 'program', label: t.fullProgram }]} />}
             <Select className="assembly-select" label={t.function} value="" placeholder={t.function} dir={dir} disabled={!summary?.functions.some(fn => fn.lines.length)} onChange={value => {
               const fn = summary?.functions.find(item => String(item.id) === value)
               if (fn?.lines.length) assemblyEditor.current?.reveal(fn.lines[0])
@@ -264,7 +295,8 @@ export function App() {
             <div className="assembly-search"><Search size={13} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder={t.search} aria-label={t.search} />{search && <><span className="search-count" dir="ltr">{matches.length ? `${matchIndex + 1}/${matches.length}` : '0'}</span><button onClick={() => moveMatch(-1)} disabled={!matches.length} aria-label={t.previousMatch}><ChevronLeft size={13} /></button><button onClick={() => moveMatch(1)} disabled={!matches.length} aria-label={t.nextMatch}><ChevronRight size={13} /></button><button onClick={() => setSearch('')} aria-label={t.dismiss}><X size={12} /></button></>}</div>
           </div>}
           <div className="assembly-body">
-            <CodeEditor ref={assemblyEditor} kind="assembly" value={program?.assembly ?? ''} label={t.assemblyLabel} onSelect={line => void select('assembly', line)} onCompile={() => void compile()} />
+            <CodeEditor ref={assemblyEditor} kind="assembly" value={program?.assembly ?? ''} label={t.assemblyLabel} onSelect={line => void select('assembly', line)} onHover={line => void hoverLine('assembly', line)} onCompile={() => void compile()} />
+            {linked && sourceCard && <SourceCard details={selection.details} source={compiledSource} t={t} onReveal={line => sourceEditor.current?.reveal(line)} onClose={() => setSourceCard(false)} onHover={active => { ++hoverSerial.current; setHover(active ? selection : emptySelection) }} />}
             {!program && <div className="assembly-empty" data-testid="assembly-empty" />}
             {busy && program && <div className="compiling-overlay" />}
           </div>

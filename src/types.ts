@@ -1,6 +1,6 @@
 export type Language = 'en' | 'zh' | 'he'
 export type Target = 'tpu-v4-tc' | 'tpu-v6e-tc'
-export type ExampleId = 'clamp' | 'square' | 'matmul'
+export type ExampleId = 'clamp' | 'square' | 'matmul' | 'top_k' | 'double_buffer'
 export interface Config {
   versions: Record<string, string>
   targets: { id: Target; name: string }[]
@@ -58,20 +58,39 @@ export interface Summary {
   diagnostics: string[]
   mappings: { line: number; assembly_lines: number[] }[]
   functions: { id: number; name: string; lines: number[] }[]
+  kernel_ranges: { start: number; end: number }[]
   preferred_line: number
   pc_lines: { line: number; pc: number }[]
+  hints: { line: number; source_lines: number[]; primitive: string | null; captured: boolean }[]
+}
+// One captured call chain, innermost frame first; labels merge every scope and
+// LLO ordinal recorded for the same chain.
+export interface SourceChain {
+  frames: SourceFrame[]
+  labels: { scopes: string[]; ordinals: number[] }[]
+}
+export interface SourceView {
+  chains: SourceChain[]
+  compiler: SourceFrame[]
+  notes: string[]
 }
 export interface Selection {
   assembly_lines: number[]
+  caller_assembly_lines: number[]
   source_lines: number[]
+  caller_source_lines: number[]
+  source_ranges: SourceFrame[]
   details: {
     instruction: Instruction
+    view: SourceView
     source: {
       compiler_annotation: string
       annotation_locations: SourceFrame[]
       origins: Origin[]
       function_symbols: number[]
+      source_frames: SourceFrame[]
+      source_kind: 'captured' | 'compiler_location' | 'unknown'
     } | null
   }[]
 }
-export const emptySelection: Selection = { assembly_lines: [], source_lines: [], details: [] }
+export const emptySelection: Selection = { assembly_lines: [], caller_assembly_lines: [], source_lines: [], caller_source_lines: [], source_ranges: [], details: [] }

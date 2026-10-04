@@ -87,7 +87,9 @@ async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
         "examples":[
             {"id":"clamp","source":include_str!("../../../examples/clamp.py")},
             {"id":"square","source":include_str!("../../../examples/square.py")},
-            {"id":"matmul","source":include_str!("../../../examples/matmul.py")}
+            {"id":"matmul","source":include_str!("../../../examples/matmul.py")},
+            {"id":"top_k","source":include_str!("../../../examples/top_k.py")},
+            {"id":"double_buffer","source":include_str!("../../../examples/double_buffer.py")}
         ],
         "timeout_seconds":state.timeout.as_secs(), "source_limit":262144,
     }))

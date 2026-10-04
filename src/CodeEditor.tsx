@@ -2,7 +2,13 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import * as monaco from 'monaco-editor/editor/editor.api.js'
 import 'monaco-editor/languages/definitions/python/register.js'
 import EditorWorker from 'monaco-editor/editor/editor.worker.js?worker'
-import type { Summary } from './types'
+import type { SourceFrame, Summary } from './types'
+
+// The pinned Monaco build exposes the same hidden-area primitive used by its
+// folding controller, but omits it from the standalone editor's public type.
+type HiddenAreaEditor = monaco.editor.IStandaloneCodeEditor & {
+  setHiddenAreas: (ranges: monaco.Range[], source?: unknown, forceUpdate?: boolean) => void
+}
 
 self.MonacoEnvironment = { getWorker: () => new EditorWorker() }
 monaco.languages.register({ id: 'tpuasm' })
@@ -48,9 +54,19 @@ monaco.editor.defineTheme('hoata', {
   },
 })
 
+// Linked lines are the hovered line's direct counterparts; caller lines are
+// reached only through a caller frame (e.g. the pl.loop line of a loop body).
+export interface Highlight {
+  lines: number[]
+  callers: number[]
+  ranges: SourceFrame[]
+}
+export const noHighlight: Highlight = { lines: [], callers: [], ranges: [] }
+
 export interface EditorHandle {
   reveal: (line: number) => void
-  decorate: (summary: Summary | null, selected: number[], matches?: number[]) => void
+  decorate: (summary: Summary | null, highlight: Highlight, matches?: number[]) => void
+  showOnly: (ranges: { start: number; end: number }[] | null) => void
   markErrors: (errors: { message: string; line?: number | null }[]) => void
   focus: () => void
 }
@@ -60,6 +76,7 @@ interface Props {
   label: string
   onChange?: (value: string) => void
   onSelect: (line: number) => void
+  onHover?: (line: number | null) => void
   onCompile: () => void
   onCursor?: (line: number, column: number) => void
 }
@@ -72,6 +89,7 @@ export const CodeEditor = forwardRef<EditorHandle, Props>(function CodeEditor(pr
   current.current = props
   const replacing = useRef(false)
   const pcLines = useRef(new Map<number, number>())
+  const hovered = useRef<number | null>(null)
 
   useImperativeHandle(ref, () => ({
     reveal(line) {
@@ -79,6 +97,31 @@ export const CodeEditor = forwardRef<EditorHandle, Props>(function CodeEditor(pr
       editor.current?.setPosition({ lineNumber: line, column: 1 }, 'hoata')
     },
     focus() { editor.current?.focus() },
+    showOnly(ranges) {
+      const instance = editor.current
+      const model = instance?.getModel()
+      if (!instance || !model || props.kind !== 'assembly' || !ranges?.length) {
+        if (instance) (instance as HiddenAreaEditor).setHiddenAreas([])
+        return
+      }
+      const visible = [{ start: 1, end: 1 }, ...ranges]
+        .sort((left, right) => left.start - right.start)
+        .reduce<{ start: number; end: number }[]>((merged, range) => {
+          const previous = merged.at(-1)
+          if (previous && range.start <= previous.end + 1) previous.end = Math.max(previous.end, range.end)
+          else merged.push({ ...range })
+          return merged
+        }, [])
+      const hidden: monaco.Range[] = []
+      let line = 1
+      for (const range of visible) {
+        if (line < range.start) hidden.push(new monaco.Range(line, 1, range.start - 1, 1))
+        line = Math.max(line, range.end + 1)
+      }
+      if (line <= model.getLineCount()) hidden.push(new monaco.Range(line, 1, model.getLineCount(), 1))
+      const hiddenEditor = instance as HiddenAreaEditor
+      hiddenEditor.setHiddenAreas(hidden)
+    },
     markErrors(errors) {
       const model = editor.current?.getModel()
       if (model) monaco.editor.setModelMarkers(model, 'hoata', errors.filter(error => error.line).map(error => ({
@@ -86,20 +129,45 @@ export const CodeEditor = forwardRef<EditorHandle, Props>(function CodeEditor(pr
         startLineNumber: error.line!, endLineNumber: error.line!, startColumn: 1, endColumn: model.getLineMaxColumn(error.line!),
       })))
     },
-    decorate(summary, selected, matches = []) {
+    decorate(summary, highlight, matches = []) {
       const items: monaco.editor.IModelDeltaDecoration[] = []
-      const colors = new Map<number, number>()
+      const model = editor.current?.getModel()
+      // An instruction's .encoding continuation belongs to the same block.
+      const block = (line: number) => {
+        const lines = [line]
+        while (model && props.kind === 'assembly' && line < model.getLineCount() && model.getLineContent(line + 1).trimStart().startsWith('.encoding')) lines.push(++line)
+        return lines
+      }
+      // Like Compiler Explorer: each source line and its instructions share a
+      // grey shade; neighbouring source lines use different shades.
+      const shades = new Map<number, number>()
       for (const mapping of summary?.mappings ?? []) {
-        for (const line of props.kind === 'source' ? [mapping.line] : mapping.assembly_lines) {
-          if (!colors.has(line)) colors.set(line, mapping.line % 6)
+        for (const line of props.kind === 'source' ? [mapping.line] : mapping.assembly_lines.flatMap(block)) {
+          if (!shades.has(line)) shades.set(line, mapping.line % 4)
         }
       }
-      for (const [line, color] of colors) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
-        isWholeLine: true, className: `mapped-line map-${color}`, linesDecorationsClassName: `mapping-stripe stripe-${color}`,
+      for (const [line, shade] of shades) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
+        isWholeLine: true, className: `mapped-line shade-${shade}`,
       } })
-      for (const line of selected) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
-        isWholeLine: true, className: 'selected-source-line', linesDecorationsClassName: 'selected-stripe', zIndex: 10,
+      for (const line of highlight.callers.flatMap(block)) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
+        isWholeLine: true, className: 'linked-caller', zIndex: 8,
       } })
+      for (const line of highlight.lines.flatMap(block)) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
+        isWholeLine: true, className: 'linked-line', zIndex: 10,
+      } })
+      // tpuasm columns are Python AST offsets: 0-based, end exclusive.
+      for (const frame of highlight.ranges) items.push({ range: new monaco.Range(frame.line_start, frame.col_start + 1, frame.line_end, frame.col_end + 1), options: {
+        className: 'linked-range', zIndex: 12,
+      } })
+      // Source hints trail each mapped instruction: primary kernel.py lines and
+      // the first recorded primitive; the full chain is in the source card.
+      if (props.kind === 'assembly' && model) for (const hint of summary?.hints ?? []) {
+        const end = model.getLineMaxColumn(hint.line)
+        items.push({ range: new monaco.Range(hint.line, end, hint.line, end), options: {
+          after: { content: `\u2003${hint.source_lines.join(', ')}${hint.primitive ? ` ${hint.primitive}` : ''}`, inlineClassName: hint.captured ? 'source-hint' : 'source-hint compiler-hint' },
+          showIfCollapsed: true,
+        } })
+      }
       for (const line of matches) items.push({ range: new monaco.Range(line, 1, line, 1), options: {
         isWholeLine: true, className: 'search-line', zIndex: 5,
       } })
@@ -140,9 +208,21 @@ export const CodeEditor = forwardRef<EditorHandle, Props>(function CodeEditor(pr
     const click = instance.onMouseDown(event => {
       if (event.target.position) current.current.onSelect(event.target.position.lineNumber)
     })
+    // Hovering links both panes; .encoding lines resolve to their instruction.
+    const hover = (line: number | null) => {
+      const model = instance.getModel()
+      if (line !== null && model && props.kind === 'assembly') {
+        while (line > 1 && model.getLineContent(line).trimStart().startsWith('.encoding')) line--
+      }
+      if (line === hovered.current) return
+      hovered.current = line
+      current.current.onHover?.(line)
+    }
+    const move = instance.onMouseMove(event => hover(event.target.position?.lineNumber ?? null))
+    const leave = instance.onMouseLeave(() => hover(null))
     const action = instance.addAction({ id: 'hoata.compile', label: 'Compile', keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter], run: () => current.current.onCompile() })
     return () => {
-      change.dispose(); position.dispose(); click.dispose(); action.dispose()
+      change.dispose(); position.dispose(); click.dispose(); move.dispose(); leave.dispose(); action.dispose()
       const model = instance.getModel()
       instance.dispose(); model?.dispose(); editor.current = null
     }
